@@ -1,5 +1,5 @@
 // 8c.cpp
-// g++ -std=c++17 -O2 -Wall -Wextra -pedantic -static -mconsole 8c.cpp -o 8c.exe -lgdi32 -lwinmm
+// g++ -std=c++17 -O2 -Wall -Wextra -pedantic -static -mconsole 8c.cpp version.o -o 8c.exe -lgdi32 -lwinmm
 
 #include <algorithm>
 #include <array>
