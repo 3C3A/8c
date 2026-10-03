@@ -1,5 +1,5 @@
 // 8c.cpp
-// g++ -std=c++17 -O2 -Wall -Wextra -pedantic -static -mconsole 8c.cpp version.o -o 8c.exe -lgdi32 -lwinmm
+// g++ -std=c++17 -O2 -Wall -Wextra -pedantic -static -mconsole 8c.cpp -o 8c.exe -lgdi32 -lwinmm
 
 #include <algorithm>
 #include <array>
@@ -12,6 +12,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -31,12 +32,24 @@ namespace eightc {
 
 constexpr int CUI_W = 32;
 constexpr int CUI_H = 8;
-constexpr int MEM_BLOCKS = 8;
+constexpr int MEM_BLOCKS = 256;
 constexpr int MEM_SPACES = 2;
+constexpr size_t WIDE_INSTRUCTION_SIZE = 11;
+constexpr uint8_t WIDE_INSTRUCTION_SEPARATOR = 0x24; // '$'
 
 struct Cell {
     char ch = ' ';
     uint8_t bg = 0; // RGB bit order: R=4, G=2, B=1.
+};
+
+constexpr int WIDE_W = 512;
+constexpr int WIDE_H = 192;
+
+struct WideTextCommand {
+    uint8_t x = 0;      // VGA X: 0..31
+    uint8_t y = 0;      // VGA Y: 0..7
+    uint16_t color565 = 0;
+    uint8_t ch = 0;     // ASCII: 0..127
 };
 
 struct MachineInstruction {
@@ -45,6 +58,14 @@ struct MachineInstruction {
     uint8_t input1 = 0;
     uint8_t input2 = 0;
     int line = 0;
+};
+
+struct WideInstruction {
+    uint8_t opcode = 0;
+    uint16_t input0 = 0;
+    uint32_t input1 = 0;
+    uint32_t input2 = 0;
+    uint64_t fileOffset = 0;
 };
 
 enum class Kind {
@@ -68,9 +89,15 @@ struct ScriptInstruction {
 };
 
 static std::string trim(std::string s) {
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
-    return s;
+    const auto first = std::find_if_not(s.begin(), s.end(), [](char c) {
+        return std::isspace(static_cast<unsigned char>(c)) != 0;
+    });
+    if (first == s.end()) return {};
+
+    const auto last = std::find_if_not(s.rbegin(), s.rend(), [](char c) {
+        return std::isspace(static_cast<unsigned char>(c)) != 0;
+    }).base();
+    return std::string(first, last);
 }
 
 static std::string lower(std::string s) {
@@ -109,13 +136,73 @@ static int parseBinaryFixed(const std::string& s, int bits, const std::string& l
     return value;
 }
 
+static uint64_t parseHexFixed(const std::string& s, int digits, const std::string& label) {
+    if (s.size() != static_cast<size_t>(digits))
+        throw std::runtime_error(label + " must contain exactly " + std::to_string(digits) + " hex digits.");
+    uint64_t value = 0;
+    for (char c : s) {
+        int nibble = -1;
+        if (c >= '0' && c <= '9') nibble = c - '0';
+        else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+        if (nibble < 0) throw std::runtime_error(label + " contains a non-hex character.");
+        value = (value << 4) | static_cast<uint64_t>(nibble);
+    }
+    return value;
+}
+
+static std::string hexFixed(uint64_t value, int digits) {
+    if (digits < 1 || digits > 16)
+        throw std::runtime_error("hexFixed digit count must be 1..16");
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out(static_cast<size_t>(digits), '0');
+    for (int i = digits - 1; i >= 0; --i) {
+        out[static_cast<size_t>(i)] = hex[value & 0xFULL];
+        value >>= 4;
+    }
+    return out;
+}
+
 static int parseInteger(const std::string& s) {
     if (s.empty()) throw std::runtime_error("empty number");
+
     size_t pos = 0;
-    const long long value = std::stoll(s, &pos, 0);
-    if (pos != s.size()) throw std::runtime_error("invalid number: " + s);
-    if (value < -2147483648LL || value > 2147483647LL)
-        throw std::runtime_error("number out of 32-bit signed range: " + s);
+    bool negative = false;
+    if (s[pos] == '+' || s[pos] == '-') {
+        negative = s[pos] == '-';
+        ++pos;
+    }
+    if (pos == s.size()) throw std::runtime_error("invalid number: " + s);
+
+    int base = 10;
+    if (pos + 2 <= s.size() && s[pos] == '0' && (s[pos + 1] == 'x' || s[pos + 1] == 'X' ||
+                                                   s[pos + 1] == 'b' || s[pos + 1] == 'B')) {
+        base = (s[pos + 1] == 'x' || s[pos + 1] == 'X') ? 16 : 2;
+        pos += 2;
+    }
+
+    if (pos == s.size()) throw std::runtime_error("invalid number: " + s);
+
+    const uint64_t limit = negative ? 2147483648ULL : 2147483647ULL;
+    uint64_t value = 0;
+    for (; pos < s.size(); ++pos) {
+        const unsigned char c = static_cast<unsigned char>(s[pos]);
+        int digit = -1;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+
+        if (digit < 0 || digit >= base)
+            throw std::runtime_error("invalid number: " + s);
+        if (value > (limit - static_cast<uint64_t>(digit)) / static_cast<uint64_t>(base))
+            throw std::runtime_error("number out of 32-bit signed range: " + s);
+        value = value * static_cast<uint64_t>(base) + static_cast<uint64_t>(digit);
+    }
+
+    if (negative) {
+        if (value == 2147483648ULL) return std::numeric_limits<int>::min();
+        return -static_cast<int>(value);
+    }
     return static_cast<int>(value);
 }
 
@@ -140,6 +227,8 @@ static bool validIdentifier(const std::string& s) {
 }
 
 static std::string binFixed(uint32_t value, int bits) {
+    if (bits < 1 || bits > 32)
+        throw std::runtime_error("binFixed bit count must be 1..32");
     std::string s(static_cast<size_t>(bits), '0');
     for (int i = 0; i < bits; ++i) {
         const int shift = bits - 1 - i;
@@ -161,6 +250,12 @@ public:
     void setup() {
 #ifdef _WIN32
         if (guiThread_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(guiMutex_);
+            guiReadyFlag_ = false;
+            guiError_.clear();
+        }
+
         guiThread_ = std::thread([this] {
             try {
                 guiMain();
@@ -176,6 +271,7 @@ public:
                 guiReady_.notify_one();
             }
         });
+
         std::unique_lock<std::mutex> lock(guiMutex_);
         guiReady_.wait(lock, [this] { return guiReadyFlag_; });
         if (!guiError_.empty()) {
@@ -196,18 +292,66 @@ public:
             std::lock_guard<std::mutex> lock(guiMutex_);
             hwnd = hwnd_;
         }
-        if (hwnd != nullptr) {
+        if (hwnd != nullptr)
             PostMessageA(hwnd, WM_CLOSE, 0, 0);
-        }
-        if (guiThread_.joinable()) {
+
+        if (guiThread_.joinable())
             guiThread_.join();
-        }
 #endif
     }
 
+    // Clears only the legacy 32x8 CUI layer.
     void clear() {
-        std::lock_guard<std::mutex> lock(cellMutex_);
-        for (auto& c : cells_) c = Cell{};
+        {
+            std::lock_guard<std::mutex> lock(cellMutex_);
+            for (auto& c : cells_) c = Cell{};
+        }
+        invalidate();
+    }
+
+    // Clears both the legacy CUI layer and the HEX VGA layer.
+    void clearAll() {
+        clear();
+        clearWideStorage();
+        invalidate();
+    }
+
+    void clearWide() {
+        clearWideStorage();
+        invalidate();
+    }
+
+
+    void clearWideStorage() {
+        std::lock_guard<std::mutex> lock(wideMutex_);
+        widePixels_.fill(0);
+        wideTexts_.clear();
+    }
+
+    void widePixel(uint16_t x, uint16_t y, uint16_t color565) {
+        if (x >= WIDE_W || y >= WIDE_H) return;
+        {
+            std::lock_guard<std::mutex> lock(wideMutex_);
+            widePixels_[static_cast<size_t>(y) * WIDE_W + x] = 0x10000U | color565;
+        }
+        invalidate();
+    }
+
+    void wideText(uint8_t x, uint8_t y, uint16_t color565, uint8_t ch) {
+        if (x >= CUI_W || y >= CUI_H) return;
+        {
+            std::lock_guard<std::mutex> lock(wideMutex_);
+            bool replaced = false;
+            for (auto& existing : wideTexts_) {
+                if (existing.x == x && existing.y == y) {
+                    existing = {x, y, color565, ch};
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced)
+                wideTexts_.push_back({x, y, color565, ch});
+        }
         invalidate();
     }
 
@@ -247,9 +391,22 @@ public:
 #endif
     }
 
+#ifdef _WIN32
+    bool windowOpen() const {
+        std::lock_guard<std::mutex> lock(guiMutex_);
+        return hwnd_ != nullptr;
+    }
+#endif
+
 private:
     std::array<Cell, CUI_W * CUI_H> cells_{};
     mutable std::mutex cellMutex_;
+
+    // Pixel state is kept as a fixed raster instead of an ever-growing command log.
+    // 0 = untouched, otherwise bit 16 is the valid flag and bits 0..15 hold RGB565.
+    std::array<uint32_t, static_cast<size_t>(WIDE_W) * WIDE_H> widePixels_{};
+    std::vector<WideTextCommand> wideTexts_;
+    mutable std::mutex wideMutex_;
 
 #ifdef _WIN32
     std::thread guiThread_;
@@ -277,6 +434,13 @@ private:
         }
     }
 
+    static COLORREF color565(uint16_t c) {
+        const unsigned r = ((c >> 11) & 0x1FU) * 255U / 31U;
+        const unsigned g = ((c >> 5) & 0x3FU) * 255U / 63U;
+        const unsigned b = (c & 0x1FU) * 255U / 31U;
+        return RGB(r, g, b);
+    }
+
     void invalidate() const {
         HWND hwnd = nullptr;
         {
@@ -289,9 +453,8 @@ private:
         if (!repaintQueued_.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
             return;
 
-        if (!PostMessageA(hwnd, WM_VGA_INVALIDATE, 0, 0)) {
+        if (!PostMessageA(hwnd, WM_VGA_INVALIDATE, 0, 0))
             repaintQueued_.store(false, std::memory_order_release);
-        }
     }
 
     static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -315,16 +478,31 @@ private:
             case WM_PAINT: {
                 PAINTSTRUCT ps{};
                 HDC dc = BeginPaint(hwnd, &ps);
-                RECT client{};
-                GetClientRect(hwnd, &client);
+                if (dc == nullptr) return 0;
 
-                const int cellW = std::max(1L, (client.right - client.left) / CUI_W);
-                const int cellH = std::max(1L, (client.bottom - client.top) / CUI_H);
+                RECT client{};
+                if (!GetClientRect(hwnd, &client)) {
+                    EndPaint(hwnd, &ps);
+                    return 0;
+                }
+
+                const int clientW = client.right - client.left;
+                const int clientH = client.bottom - client.top;
+                const int cellW = std::max(1, clientW / CUI_W);
+                const int cellH = std::max(1, clientH / CUI_H);
 
                 std::array<Cell, CUI_W * CUI_H> copy{};
                 {
                     std::lock_guard<std::mutex> lock(self->cellMutex_);
                     copy = self->cells_;
+                }
+
+                std::array<uint32_t, static_cast<size_t>(WIDE_W) * WIDE_H> widePixelCopy{};
+                std::vector<WideTextCommand> wideTextCopy;
+                {
+                    std::lock_guard<std::mutex> lock(self->wideMutex_);
+                    widePixelCopy = self->widePixels_;
+                    wideTextCopy = self->wideTexts_;
                 }
 
                 HGDIOBJ oldFont = self->font_ != nullptr ? SelectObject(dc, self->font_) : nullptr;
@@ -335,10 +513,7 @@ private:
                     for (int x = 0; x < CUI_W; ++x) {
                         const Cell& c = copy[static_cast<size_t>(y * CUI_W + x)];
                         RECT r{
-                            x * cellW,
-                            y * cellH,
-                            (x + 1) * cellW,
-                            (y + 1) * cellH
+                            x * cellW, y * cellH, (x + 1) * cellW, (y + 1) * cellH
                         };
                         HBRUSH brush = self->brushes_[c.bg & 7U];
                         if (brush != nullptr) FillRect(dc, &r, brush);
@@ -346,6 +521,33 @@ private:
                         char text[2]{c.ch == '\0' ? ' ' : c.ch, '\0'};
                         DrawTextA(dc, text, 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
                     }
+                }
+
+                // HEX VGA format: mode 0 = pixel, mode 1 = text, mode 2 = clear.
+                for (int y = 0; y < WIDE_H; ++y) {
+                    for (int x = 0; x < WIDE_W; ++x) {
+                        const uint32_t packed = widePixelCopy[static_cast<size_t>(y) * WIDE_W + x];
+                        if ((packed & 0x10000U) != 0)
+                            SetPixelV(dc, x, y, self->color565(static_cast<uint16_t>(packed & 0xFFFFU)));
+                    }
+                }
+
+                for (const WideTextCommand& cmd : wideTextCopy) {
+                    SetBkMode(dc, TRANSPARENT);
+                    SetTextColor(dc, self->color565(cmd.color565));
+                    SetTextAlign(dc, TA_LEFT | TA_TOP);
+
+                    // HEX VGA uses the same YYYXXXXX character-cell coordinates as
+                    // legacy VGA. Convert the 32x8 cell position to the actual
+                    // 16x24 pixel cell used by the window.
+                    const int textX = static_cast<int>(cmd.x) * cellW;
+                    const int textY = static_cast<int>(cmd.y) * cellH;
+                    const wchar_t text[2]{
+                        static_cast<wchar_t>(cmd.ch),
+                        L'\0'
+                    };
+
+                    TextOutW(dc, textX, textY, text, 1);
                 }
 
                 if (oldFont != nullptr) SelectObject(dc, oldFont);
@@ -357,11 +559,12 @@ private:
                 DestroyWindow(hwnd);
                 return 0;
 
-            case WM_DESTROY:
+            case WM_DESTROY: {
                 {
                     std::lock_guard<std::mutex> lock(self->guiMutex_);
                     self->hwnd_ = nullptr;
                 }
+
                 if (self->font_ != nullptr) {
                     DeleteObject(self->font_);
                     self->font_ = nullptr;
@@ -372,9 +575,15 @@ private:
                         brush = nullptr;
                     }
                 }
+
                 self->repaintQueued_.store(false, std::memory_order_release);
                 PostQuitMessage(0);
                 return 0;
+            }
+
+            case WM_NCDESTROY:
+                SetWindowLongPtrA(hwnd, GWLP_USERDATA, 0);
+                break;
         }
         return DefWindowProcA(hwnd, msg, wp, lp);
     }
@@ -382,6 +591,9 @@ private:
     void guiMain() {
         const char* className = "8cVGAWindowClass";
         HINSTANCE instance = GetModuleHandleA(nullptr);
+        if (instance == nullptr) {
+            throw std::runtime_error("GetModuleHandleA failed. Error=" + std::to_string(GetLastError()));
+        }
 
         WNDCLASSA wc{};
         wc.lpfnWndProc = wndProc;
@@ -390,67 +602,42 @@ private:
         wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
         wc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
         const ATOM atom = RegisterClassA(&wc);
-        if (atom == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-            std::lock_guard<std::mutex> lock(guiMutex_);
-            guiError_ = "RegisterClassA failed.";
-            guiReadyFlag_ = true;
-            guiReady_.notify_one();
-            return;
-        }
+        if (atom == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            throw std::runtime_error("RegisterClassA failed. Error=" + std::to_string(GetLastError()));
 
-        // 16x24 logical cell size -> exact 32x8 character grid in the client area.
-        const int clientW = 32 * 16;
-        const int clientH = 8 * 24;
+        const int clientW = CUI_W * 16;
+        const int clientH = CUI_H * 24;
         RECT wr{0, 0, clientW, clientH};
-        AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
+        if (!AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE))
+            throw std::runtime_error("AdjustWindowRect failed. Error=" + std::to_string(GetLastError()));
 
         HWND hwnd = CreateWindowExA(
-            0,
-            className,
-            "8c VGA 32x8",
+            0, className, "8c VGA 32x8",
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            wr.right - wr.left,
-            wr.bottom - wr.top,
-            nullptr,
-            nullptr,
-            instance,
-            this
-        );
+            CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top,
+            nullptr, nullptr, instance, this);
 
-        if (hwnd == nullptr) {
-            std::lock_guard<std::mutex> lock(guiMutex_);
-            guiError_ = "CreateWindowExA failed. Error=" + std::to_string(GetLastError());
-            guiReadyFlag_ = true;
-            guiReady_.notify_one();
-            return;
+        if (hwnd == nullptr)
+            throw std::runtime_error("CreateWindowExA failed. Error=" + std::to_string(GetLastError()));
+
+        font_ = CreateFontW(
+            22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            FIXED_PITCH | FF_MODERN, L"Consolas");
+
+        for (size_t i = 0; i < brushes_.size(); ++i) {
+            brushes_[i] = CreateSolidBrush(static_cast<COLORREF>(bgColor(static_cast<uint8_t>(i))));
+            if (brushes_[i] == nullptr) {
+                const DWORD error = GetLastError();
+                DestroyWindow(hwnd);
+                throw std::runtime_error("CreateSolidBrush failed. Error=" + std::to_string(error));
+            }
         }
 
-        font_ = CreateFontA(
-            22, 0, 0, 0,
-            FW_NORMAL,
-            FALSE, FALSE, FALSE,
-            ANSI_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            DEFAULT_QUALITY,
-            FIXED_PITCH | FF_MODERN,
-            "Consolas"
-        );
-
-        for (size_t i = 0; i < brushes_.size(); ++i)
-            brushes_[i] = CreateSolidBrush(static_cast<COLORREF>(bgColor(static_cast<uint8_t>(i))));
-
         if (font_ == nullptr) {
-            {
-                std::lock_guard<std::mutex> lock(guiMutex_);
-                guiError_ = "CreateFontA failed.";
-                guiReadyFlag_ = true;
-            }
-            guiReady_.notify_one();
+            const DWORD error = GetLastError();
             DestroyWindow(hwnd);
-            return;
+            throw std::runtime_error("CreateFontW failed. Error=" + std::to_string(error));
         }
 
         {
@@ -489,6 +676,10 @@ public:
         auto nextTick = std::chrono::steady_clock::now();
 
         while (pc < code.size()) {
+#ifdef _WIN32
+            if (!display_.windowOpen())
+                throw std::runtime_error("VGA window was closed while executing the program");
+#endif
             const ScriptInstruction& s = code[pc];
             bool advance = true;
 
@@ -519,27 +710,25 @@ public:
                 }
 
                 case Kind::RamWrite: {
-                    const int address = fixedOrValue(s.p[0], 4, "RAM address");
-                    const int space = fixedOrValue(s.p[1], 8, "RAM space");
+                    const int space = fixedOrValue(s.p[0], 4, "RAM space");
+                    const int address = fixedOrValue(s.p[1], 8, "RAM address");
                     const int value = fixedOrValue(s.p[2], 8, "RAM value");
-                    execute({2, static_cast<uint8_t>(address), static_cast<uint8_t>(space), static_cast<uint8_t>(value), s.line});
+                    execute({2, static_cast<uint8_t>(space), static_cast<uint8_t>(address), static_cast<uint8_t>(value), s.line});
                     waitClock(nextTick);
                     break;
                 }
 
                 case Kind::RamRead: {
-                    const int address = fixedOrValue(s.p[0], 4, "RAM address");
-                    const int space = fixedOrValue(s.p[1], 8, "RAM space");
-                    // RAMR keeps the same three input fields as RAMW; INPUT2 is unused by the CPU.
+                    const int space = fixedOrValue(s.p[0], 4, "RAM space");
+                    const int address = fixedOrValue(s.p[1], 8, "RAM address");
                     (void)fixedOrValue(s.p[2], 8, "RAM read unused input");
-                    execute({3, static_cast<uint8_t>(address), static_cast<uint8_t>(space), 0, s.line});
+                    execute({3, static_cast<uint8_t>(space), static_cast<uint8_t>(address), 0, s.line});
                     waitClock(nextTick);
                     break;
                 }
 
                 case Kind::Vga: {
-                    // VGA uses the same three fields as the 24-bit instruction format.
-                    // input0 = RGB(3bit)+mode(1bit), input1 = Y(3bit)+X(5bit), input2 = ASCII(8bit).
+                    // Legacy VGA uses input0=RGB(3bit)+mode(1bit), input1=YYYXXXXX, input2=ASCII(8bit).
                     const int input0 = fixedOrValue(s.p[0], 4, "VGA input0");
                     const int input1 = fixedOrValue(s.p[1], 8, "VGA input1");
                     const int input2 = fixedOrValue(s.p[2], 8, "VGA input2");
@@ -586,21 +775,40 @@ public:
         }
     }
 
+    void run16(const std::vector<WideInstruction>& code) {
+        auto nextTick = std::chrono::steady_clock::now();
+        for (const WideInstruction& wi : code) {
+#ifdef _WIN32
+            if (!display_.windowOpen())
+                throw std::runtime_error("VGA window was closed while executing the program");
+#endif
+            executeWide(wi);
+            waitClock(nextTick);
+        }
+    }
+
     void prompt() {
         std::string line;
         for (;;) {
+#ifdef _WIN32
+            if (!display_.windowOpen())
+                break;
+#endif
             std::cout << "8c> " << std::flush;
             if (!std::getline(std::cin, line)) break;
             line = trim(line);
             if (line.empty()) continue;
 
-            const std::string cmd = lower(line);
+            const auto words = splitWords(line);
+            const std::string cmd = words.empty() ? std::string{} : lower(words[0]);
             if (cmd == "quit" || cmd == "exit") break;
 
             try {
-                const MachineInstruction mi = parsePromptInstruction(line);
-                execute(mi);
-                display_.render();
+                if (cmd == "hex") {
+                    executeWide(parseHexPromptInstruction(line));
+                } else {
+                    execute(parsePromptInstruction(line));
+                }
             } catch (const std::exception& e) {
                 std::cout << "ERROR: " << e.what() << '\n' << std::flush;
             }
@@ -610,32 +818,155 @@ public:
 private:
     double hz_;
     std::array<std::array<uint8_t, MEM_BLOCKS>, MEM_SPACES> memory_{};
+    std::unordered_map<uint64_t, uint32_t> wideMemory_;
     std::unordered_map<std::string, int> vars_;
     Display display_;
 
-    int evaluate(const std::string& expr) const {
-        const std::string e = trim(expr);
-        for (char op : std::string("+-*/")) {
-            const size_t p = e.find(op, 1);
-            if (p == std::string::npos) continue;
-            const int left = evaluateAtom(trim(e.substr(0, p)));
-            const int right = evaluateAtom(trim(e.substr(p + 1)));
-            switch (op) {
-                case '+': return left + right;
-                case '-': return left - right;
-                case '*': return left * right;
-                case '/':
-                    if (right == 0) throw std::runtime_error("division by zero");
-                    return left / right;
+    class ExpressionParser {
+    public:
+        ExpressionParser(const VM& vm, const std::string& text) : vm_(vm), text_(text) {}
+
+        int parse() {
+            skipSpace();
+            if (pos_ == text_.size()) throw std::runtime_error("empty expression");
+            const int64_t result = parseAddSub();
+            skipSpace();
+            if (pos_ != text_.size())
+                throw std::runtime_error("unexpected character in expression: " + std::string(1, text_[pos_]));
+            if (result < std::numeric_limits<int>::min() || result > std::numeric_limits<int>::max())
+                throw std::runtime_error("expression result is out of 32-bit signed range");
+            return static_cast<int>(result);
+        }
+
+    private:
+        const VM& vm_;
+        const std::string& text_;
+        size_t pos_ = 0;
+
+        void skipSpace() {
+            while (pos_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[pos_]))) ++pos_;
+        }
+
+        static int64_t checkedAdd(int64_t a, int64_t b) {
+            if ((b > 0 && a > std::numeric_limits<int64_t>::max() - b) ||
+                (b < 0 && a < std::numeric_limits<int64_t>::min() - b))
+                throw std::runtime_error("expression arithmetic overflow");
+            return a + b;
+        }
+
+        static int64_t checkedSub(int64_t a, int64_t b) {
+            if ((b < 0 && a > std::numeric_limits<int64_t>::max() + b) ||
+                (b > 0 && a < std::numeric_limits<int64_t>::min() + b))
+                throw std::runtime_error("expression arithmetic overflow");
+            return a - b;
+        }
+
+        static int64_t checkedMul(int64_t a, int64_t b) {
+            if (a == 0 || b == 0) return 0;
+            if (a == -1 && b == std::numeric_limits<int64_t>::min())
+                throw std::runtime_error("expression arithmetic overflow");
+            if (b == -1 && a == std::numeric_limits<int64_t>::min())
+                throw std::runtime_error("expression arithmetic overflow");
+            if (a > 0) {
+                if (b > 0 && a > std::numeric_limits<int64_t>::max() / b)
+                    throw std::runtime_error("expression arithmetic overflow");
+                if (b < 0 && b < std::numeric_limits<int64_t>::min() / a)
+                    throw std::runtime_error("expression arithmetic overflow");
+            } else {
+                if (b > 0 && a < std::numeric_limits<int64_t>::min() / b)
+                    throw std::runtime_error("expression arithmetic overflow");
+                if (b < 0 && a < std::numeric_limits<int64_t>::max() / b)
+                    throw std::runtime_error("expression arithmetic overflow");
+            }
+            return a * b;
+        }
+
+        static int64_t checkedDiv(int64_t a, int64_t b) {
+            if (b == 0) throw std::runtime_error("division by zero");
+            if (a == std::numeric_limits<int64_t>::min() && b == -1)
+                throw std::runtime_error("expression arithmetic overflow");
+            return a / b;
+        }
+
+        int64_t parseAddSub() {
+            int64_t value = parseMulDiv();
+            for (;;) {
+                skipSpace();
+                if (pos_ >= text_.size() || (text_[pos_] != '+' && text_[pos_] != '-')) return value;
+                const char op = text_[pos_++];
+                const int64_t rhs = parseMulDiv();
+                value = (op == '+') ? checkedAdd(value, rhs) : checkedSub(value, rhs);
             }
         }
-        return evaluateAtom(e);
-    }
 
-    int evaluateAtom(const std::string& token) const {
-        auto it = vars_.find(token);
-        if (it != vars_.end()) return it->second;
-        return parseInteger(token);
+        int64_t parseMulDiv() {
+            int64_t value = parseUnary();
+            for (;;) {
+                skipSpace();
+                if (pos_ >= text_.size() || (text_[pos_] != '*' && text_[pos_] != '/')) return value;
+                const char op = text_[pos_++];
+                const int64_t rhs = parseUnary();
+                value = (op == '*') ? checkedMul(value, rhs) : checkedDiv(value, rhs);
+            }
+        }
+
+        int64_t parseUnary() {
+            skipSpace();
+            if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-')) {
+                const char op = text_[pos_++];
+                const int64_t value = parseUnary();
+                if (op == '-' && value == std::numeric_limits<int64_t>::min())
+                    throw std::runtime_error("expression arithmetic overflow");
+                return op == '-' ? -value : value;
+            }
+            return parsePrimary();
+        }
+
+        int64_t parsePrimary() {
+            skipSpace();
+            if (pos_ >= text_.size())
+                throw std::runtime_error("missing expression operand");
+
+            if (text_[pos_] == '(') {
+                ++pos_;
+                const int64_t value = parseAddSub();
+                skipSpace();
+                if (pos_ >= text_.size() || text_[pos_] != ')')
+                    throw std::runtime_error("missing ')' in expression");
+                ++pos_;
+                return value;
+            }
+
+            const char first = text_[pos_];
+            if (std::isdigit(static_cast<unsigned char>(first))) {
+                const size_t begin = pos_;
+                while (pos_ < text_.size() &&
+                       (std::isalnum(static_cast<unsigned char>(text_[pos_])) || text_[pos_] == '_'))
+                    ++pos_;
+                return parseInteger(text_.substr(begin, pos_ - begin));
+            }
+
+            if (std::isalpha(static_cast<unsigned char>(first)) || first == '_') {
+                const size_t begin = pos_;
+                ++pos_;
+                while (pos_ < text_.size()) {
+                    const unsigned char c = static_cast<unsigned char>(text_[pos_]);
+                    if (!std::isalnum(c) && text_[pos_] != '_') break;
+                    ++pos_;
+                }
+                const std::string name = text_.substr(begin, pos_ - begin);
+                const auto it = vm_.vars_.find(name);
+                if (it == vm_.vars_.end())
+                    throw std::runtime_error("unknown variable: " + name);
+                return it->second;
+            }
+
+            throw std::runtime_error("invalid expression at position " + std::to_string(pos_));
+        }
+    };
+
+    int evaluate(const std::string& expr) const {
+        return ExpressionParser(*this, expr).parse();
     }
 
     static int requireU8(int value, const std::string& label) {
@@ -645,10 +976,12 @@ private:
     }
 
     int fixedOrValue(const std::string& token, int bits, const std::string& label) const {
+        if (bits < 1 || bits > 31)
+            throw std::runtime_error("unsupported field width: " + std::to_string(bits));
         const int value = exactBinary(token, static_cast<size_t>(bits))
                                ? parseBinaryFixed(token, bits, label)
                                : evaluate(token);
-        const int maxValue = (1 << bits) - 1;
+        const int maxValue = static_cast<int>((uint32_t{1} << bits) - 1U);
         if (value < 0 || value > maxValue)
             throw std::runtime_error(label + " must fit in " + std::to_string(bits) + " bits");
         return value;
@@ -741,23 +1074,19 @@ private:
             }
 
             case 2: {
-                const int spaceCode = mi.input1 & 0x03;
-                if (spaceCode != 1 && spaceCode != 2)
-                    throw std::runtime_error("RAM space must be 01 or 10");
-                if (mi.input0 > 7)
-                    throw std::runtime_error("for the 128-bit layout, RAM address uses 0000..0111 per space");
-                const int space = spaceCode - 1;
-                memory_[static_cast<size_t>(space)][mi.input0] = mi.input2;
+                // INPUT0: memory space (0000 = space 1, 0001 = space 2)
+                // INPUT1: 8-bit block address (0..255)
+                // INPUT2: 8-bit value
+                if (mi.input0 > 1)
+                    throw std::runtime_error("RAM space must be 0000 or 0001");
+                memory_[mi.input0][mi.input1] = mi.input2;
                 break;
             }
 
             case 3: {
-                const int spaceCode = mi.input1 & 0x03;
-                if (spaceCode != 1 && spaceCode != 2)
-                    throw std::runtime_error("RAM space must be 01 or 10");
-                if (mi.input0 > 7)
-                    throw std::runtime_error("for the 128-bit layout, RAM address uses 0000..0111 per space");
-                const uint8_t value = memory_[static_cast<size_t>(spaceCode - 1)][mi.input0];
+                if (mi.input0 > 1)
+                    throw std::runtime_error("RAM space must be 0000 or 0001");
+                const uint8_t value = memory_[mi.input0][mi.input1];
                 showMessage("RAM = " + binFixed(value, 8));
                 break;
             }
@@ -802,6 +1131,171 @@ private:
         }
     }
 
+    void executeWide(const WideInstruction& wi) {
+        switch (wi.opcode) {
+            case 1: { // 1024Hz-equivalent programmable waveform
+#ifdef _WIN32
+                if (wi.input2 == 0)
+                    break;
+
+                // 32 samples per period at 32768 Hz -> 1024 Hz base frequency.
+                constexpr DWORD sampleRate = 32768;
+                constexpr size_t samplesPerPattern = 32;
+                constexpr uint32_t chunkMs = 1000;
+                constexpr size_t chunkSamples = sampleRate * chunkMs / 1000;
+
+                const uint32_t durationMs = wi.input2;
+                const int amplitude = static_cast<int>((static_cast<uint64_t>(wi.input0) * 127ULL) / 65535ULL);
+                const uint32_t pattern = wi.input1;
+
+                WAVEFORMATEX format{};
+                format.wFormatTag = WAVE_FORMAT_PCM;
+                format.nChannels = 1;
+                format.nSamplesPerSec = sampleRate;
+                format.wBitsPerSample = 8;
+                format.nBlockAlign = 1;
+                format.nAvgBytesPerSec = sampleRate;
+
+                HWAVEOUT waveOut = nullptr;
+                MMRESULT result = waveOutOpen(&waveOut, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL);
+                if (result != MMSYSERR_NOERROR)
+                    throw std::runtime_error("waveOutOpen failed: " + std::to_string(result));
+
+                uint64_t totalSamples = (static_cast<uint64_t>(sampleRate) * durationMs + 999ULL) / 1000ULL;
+                uint64_t generated = 0;
+
+                while (generated < totalSamples) {
+                    const size_t count = static_cast<size_t>(std::min<uint64_t>(chunkSamples, totalSamples - generated));
+                    std::vector<uint8_t> samples(count);
+                    for (size_t i = 0; i < count; ++i) {
+                        const uint64_t sampleIndex = generated + i;
+                        const int bitIndex = 31 - static_cast<int>(sampleIndex % samplesPerPattern);
+                        const int bit = (pattern >> bitIndex) & 1U;
+                        samples[i] = static_cast<uint8_t>(128 + (bit ? amplitude : -amplitude));
+                    }
+
+                    WAVEHDR header{};
+                    header.lpData = reinterpret_cast<LPSTR>(samples.data());
+                    header.dwBufferLength = static_cast<DWORD>(samples.size());
+
+                    result = waveOutPrepareHeader(waveOut, &header, sizeof(header));
+                    if (result != MMSYSERR_NOERROR) {
+                        waveOutClose(waveOut);
+                        throw std::runtime_error("waveOutPrepareHeader failed: " + std::to_string(result));
+                    }
+
+                    result = waveOutWrite(waveOut, &header, sizeof(header));
+                    if (result != MMSYSERR_NOERROR) {
+                        waveOutUnprepareHeader(waveOut, &header, sizeof(header));
+                        waveOutClose(waveOut);
+                        throw std::runtime_error("waveOutWrite failed: " + std::to_string(result));
+                    }
+
+                    while ((header.dwFlags & WHDR_DONE) == 0)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+                    waveOutUnprepareHeader(waveOut, &header, sizeof(header));
+                    generated += count;
+                }
+
+                waveOutClose(waveOut);
+#else
+                std::this_thread::sleep_for(std::chrono::milliseconds(wi.input2));
+#endif
+                break;
+            }
+
+            case 2: { // sparse 32-bit word RAM
+                const uint64_t key = (static_cast<uint64_t>(wi.input0) << 32) | wi.input1;
+                wideMemory_[key] = wi.input2;
+                break;
+            }
+
+            case 3: {
+                const uint64_t key = (static_cast<uint64_t>(wi.input0) << 32) | wi.input1;
+                const uint32_t value = [&] {
+                    const auto it = wideMemory_.find(key);
+                    return it == wideMemory_.end() ? 0U : it->second;
+                }();
+                showMessage("RAM32=" + hexFixed(value, 8) + "\nDEC=" + std::to_string(value));
+                break;
+            }
+
+            case 4: {
+                // HEX VGA text format:
+                //
+                //   04 F800 10101010 00000041
+                //    |  |    |        |
+                //    |  |    |        +-- ASCII, exactly 8 HEX digits
+                //    |  |    +----------- VGA coordinate, exactly 8 BIN bits
+                //    |  +---------------- RGB565 color, exactly 4 HEX digits
+                //    +------------------- VGA opcode, exactly 2 HEX digits
+                //
+                // Coordinate layout is the original VGA YYYXXXXX:
+                //   Y = bits 7..5 (0..7)
+                //   X = bits 4..0 (0..31)
+                //
+                // input0 = RGB565
+                // input1 = 8-bit YYYXXXXX stored in the low byte of a 32-bit field
+                // input2 = ASCII value stored as a 32-bit value
+                const uint16_t color565 = wi.input0;
+
+                if (wi.input1 > 0xFFU)
+                    throw std::runtime_error("HEX VGA coordinate must use exactly 8 binary bits (YYYXXXXX)");
+
+                if (wi.input2 > 0x7FU)
+                    throw std::runtime_error("HEX VGA character must be ASCII (00..7F)");
+
+                const uint8_t coord = static_cast<uint8_t>(wi.input1);
+                const uint8_t y = static_cast<uint8_t>((coord >> 5) & 0x07U);
+                const uint8_t x = static_cast<uint8_t>(coord & 0x1FU);
+                const uint8_t ch = static_cast<uint8_t>(wi.input2);
+
+                display_.wideText(x, y, color565, ch);
+                break;
+            }
+
+            case 5:
+            case 6:
+            case 7:
+            case 8: {
+                const int64_t a = static_cast<int64_t>(wi.input1);
+                const int64_t b = static_cast<int64_t>(wi.input2);
+                int64_t result = 0;
+                switch (wi.opcode) {
+                    case 5:
+                        if (b > 0 && a > INT64_MAX - b)
+                            throw std::runtime_error("wide ADD overflow");
+                        result = a + b;
+                        break;
+                    case 6:
+                        if (b < 0 && a > INT64_MAX + b)
+                            throw std::runtime_error("wide SUB overflow");
+                        if (b > 0 && a < INT64_MIN + b)
+                            throw std::runtime_error("wide SUB overflow");
+                        result = a - b;
+                        break;
+                    case 7:
+                        if (a != 0 && b > INT64_MAX / a)
+                            throw std::runtime_error("wide MUL overflow");
+                        result = a * b;
+                        break;
+                    case 8:
+                        if (b == 0)
+                            throw std::runtime_error("division by zero");
+                        result = a / b;
+                        break;
+                }
+                const uint64_t bits = static_cast<uint64_t>(result);
+                showMessage("OP" + std::to_string(wi.opcode) + "=" + hexFixed(bits, 16) + "\nDEC=" + std::to_string(result));
+                break;
+            }
+
+            default:
+                throw std::runtime_error("unknown wide opcode: " + std::to_string(wi.opcode));
+        }
+    }
+
     void showMessage(const std::string& msg) {
         display_.clear();
         int x = 0;
@@ -819,8 +1313,12 @@ private:
     }
 
     void waitClock(std::chrono::steady_clock::time_point& nextTick) const {
-        const auto period = std::chrono::duration<double>(1.0 / hz_);
-        nextTick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
+        auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(1.0 / hz_));
+        if (period <= std::chrono::steady_clock::duration::zero())
+            period = std::chrono::nanoseconds(1);
+
+        nextTick += period;
         const auto now = std::chrono::steady_clock::now();
         if (nextTick > now)
             std::this_thread::sleep_until(nextTick);
@@ -860,6 +1358,47 @@ private:
             0
         };
     }
+
+    static WideInstruction parseHexPromptInstruction(const std::string& line) {
+        const auto words = splitWords(line);
+        if (words.size() != 5 || lower(words[0]) != "hex")
+            throw std::runtime_error(
+                "use: hex <OP2> <COLOR/INPUT0 4hex> <COORD 8bin for VGA> <ASCII 8hex for VGA>");
+
+        const uint8_t opcode =
+            static_cast<uint8_t>(parseHexFixed(words[1], 2, "hex opcode"));
+
+        if (opcode == 0x04U) {
+            // VGA is intentionally mixed-format:
+            // opcode=2 HEX, color=4 HEX, coordinate=8 BIN, ASCII=8 HEX.
+            const uint16_t color565 =
+                static_cast<uint16_t>(parseHexFixed(words[2], 4, "HEX VGA color"));
+            const uint32_t coord =
+                static_cast<uint32_t>(parseBinaryFixed(words[3], 8, "HEX VGA coordinate"));
+            const uint32_t ascii =
+                static_cast<uint32_t>(parseHexFixed(words[4], 8, "HEX VGA ASCII"));
+
+            if (ascii > 0x7FU)
+                throw std::runtime_error("HEX VGA ASCII must fit in 00..7F");
+
+            return {
+                opcode,
+                color565,
+                coord,
+                ascii,
+                0
+            };
+        }
+
+        // Other wide instructions retain the original all-HEX prompt format.
+        return {
+            opcode,
+            static_cast<uint16_t>(parseHexFixed(words[2], 4, "hex input0")),
+            static_cast<uint32_t>(parseHexFixed(words[3], 8, "hex input1")),
+            static_cast<uint32_t>(parseHexFixed(words[4], 8, "hex input2")),
+            0
+        };
+    }
 };
 
 class Parser {
@@ -884,6 +1423,8 @@ public:
                 throw std::runtime_error(".8 line " + std::to_string(physicalLine) + ": " + e.what());
             }
         }
+        if (file.bad())
+            throw std::runtime_error("failed while reading .8 file: " + path);
         return code;
     }
 
@@ -929,14 +1470,14 @@ private:
         }
 
         if (cmd == "ramw") {
-            if (w.size() != 4) throw std::runtime_error("ramw <addr4> <space8> <value8>");
+            if (w.size() != 4) throw std::runtime_error("ramw <space4> <addr8> <value8>");
             ScriptInstruction s = make(Kind::RamWrite, logicalLine);
             s.p[0]=w[1]; s.p[1]=w[2]; s.p[2]=w[3];
             return s;
         }
 
         if (cmd == "ramr") {
-            if (w.size() != 4) throw std::runtime_error("ramr <addr4> <space8> <unused8>");
+            if (w.size() != 4) throw std::runtime_error("ramr <space4> <addr8> <unused8>");
             ScriptInstruction s = make(Kind::RamRead, logicalLine);
             s.p[0] = w[1];
             s.p[1] = w[2];
@@ -986,10 +1527,72 @@ private:
     }
 };
 
-static std::string requireExtension(const std::string& path) {
-    if (path.size() < 2 || lower(path.substr(path.size()-2)) != ".8")
-        throw std::runtime_error("first argument must be a .8 file");
-    return path;
+enum class SourceKind { Script8, Machine16 };
+
+static SourceKind requireSupportedFile(const std::string& path) {
+    if (path.size() >= 2 && lower(path.substr(path.size() - 2)) == ".8")
+        return SourceKind::Script8;
+    if (path.size() >= 3 && lower(path.substr(path.size() - 3)) == ".16")
+        return SourceKind::Machine16;
+    throw std::runtime_error("first argument must be a .8 or .16 file");
+}
+
+static std::vector<WideInstruction> load16File(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw std::runtime_error("cannot open .16 file: " + path);
+
+    std::vector<WideInstruction> code;
+    std::array<uint8_t, WIDE_INSTRUCTION_SIZE> raw{};
+    uint64_t offset = 0;
+
+    for (;;) {
+        file.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+        const std::streamsize got = file.gcount();
+
+        if (got == 0) {
+            if (file.bad() || (file.fail() && !file.eof()))
+                throw std::runtime_error("failed while reading .16 file at offset " + std::to_string(offset));
+            break;
+        }
+
+        if (got != static_cast<std::streamsize>(raw.size()))
+            throw std::runtime_error(
+                ".16 instruction at offset " + std::to_string(offset) +
+                " must contain exactly 11 bytes"
+            );
+
+        WideInstruction wi{};
+        wi.opcode = raw[0];
+        wi.input0 = static_cast<uint16_t>((static_cast<uint16_t>(raw[1]) << 8) | raw[2]);
+        wi.input1 = (static_cast<uint32_t>(raw[3]) << 24) |
+                    (static_cast<uint32_t>(raw[4]) << 16) |
+                    (static_cast<uint32_t>(raw[5]) << 8) |
+                    static_cast<uint32_t>(raw[6]);
+        wi.input2 = (static_cast<uint32_t>(raw[7]) << 24) |
+                    (static_cast<uint32_t>(raw[8]) << 16) |
+                    (static_cast<uint32_t>(raw[9]) << 8) |
+                    static_cast<uint32_t>(raw[10]);
+        wi.fileOffset = offset;
+        code.push_back(wi);
+        offset += WIDE_INSTRUCTION_SIZE;
+
+        // '$' separates .16 commands. A final separator is optional.
+        const int next = file.peek();
+        if (next == EOF)
+            break;
+
+        if (static_cast<uint8_t>(next) != WIDE_INSTRUCTION_SEPARATOR) {
+            throw std::runtime_error(
+                ".16 commands must be separated by '$' (0x24) after instruction at offset " +
+                std::to_string(wi.fileOffset)
+            );
+        }
+
+        file.get();
+        ++offset; // '$' is one byte in the .16 file, so include it in the next file offset.
+    }
+
+    return code;
 }
 
 } // namespace eightc
@@ -1000,54 +1603,65 @@ int main(int argc, char** argv) {
     try {
         std::string file;
         double hz = 1024.0;
+        SourceKind sourceKind = SourceKind::Script8;
 
         if (argc == 1) {
             // Double-click / plain execution: open an idle 8c machine at 1024 Hz.
-            file.clear();
         } else if (argc == 3) {
-            file = requireExtension(argv[1]);
+            file = argv[1];
+            sourceKind = requireSupportedFile(file);
             hz = parseClockHz(argv[2]);
         } else {
-            std::cerr << "Usage: 8c [file.8 clock_hz]\n";
+            std::cerr << "Usage: 8c [file.8|file.16 clock_hz]\n";
             return 2;
         }
 
+        // Parse the program before creating the GUI so a source-file error does not
+        // create a window only to destroy it again during exception unwinding.
+        std::vector<ScriptInstruction> program8;
+        std::vector<WideInstruction> program16;
+
+        if (!file.empty()) {
+            if (sourceKind == SourceKind::Script8)
+                program8 = Parser{}.parseFile(file);
+            else
+                program16 = load16File(file);
+        }
+
         VM vm(hz);
+
         vm.display().setup();
-        vm.display().clear();
+        vm.display().clearAll();
 
 #ifdef _WIN32
-        // Parse the program before creating the monitor thread so a .8 parse error
-        // cannot destroy a joinable std::thread during stack unwinding.
-        std::vector<ScriptInstruction> program;
-        if (!file.empty())
-            program = Parser{}.parseFile(file);
 
-        // Keep the console and VGA window as one unit.
-        // Closing either one immediately terminates the whole 8c process.
+        // Console and VGA are a single 8c instance. Closing either one
+        // immediately terminates the whole process.
         std::atomic<bool> windowMonitorRunning{true};
         std::thread windowMonitor([&windowMonitorRunning]() {
             for (;;) {
                 if (!windowMonitorRunning.load(std::memory_order_acquire))
                     return;
 
-                HWND console = GetConsoleWindow();
-                if (console == nullptr || !IsWindow(console)) {
+                const HWND console = GetConsoleWindow();
+                if (console == nullptr || !IsWindow(console))
                     ExitProcess(0);
-                }
 
-                HWND vga = FindWindowA("8cVGAWindowClass", "8c VGA 32x8");
-                if (vga == nullptr || !IsWindow(vga)) {
+                const HWND vga = FindWindowA("8cVGAWindowClass", "8c VGA 32x8");
+                if (vga == nullptr || !IsWindow(vga))
                     ExitProcess(0);
-                }
 
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         });
 
         try {
-            if (!file.empty())
-                vm.run(program);
+            if (sourceKind == SourceKind::Script8) {
+                if (!program8.empty())
+                    vm.run(program8);
+            } else {
+                vm.run16(program16);
+            }
 
             vm.prompt();
         } catch (...) {
@@ -1060,16 +1674,22 @@ int main(int argc, char** argv) {
         windowMonitorRunning.store(false, std::memory_order_release);
         if (windowMonitor.joinable())
             windowMonitor.join();
+
 #else
-        if (!file.empty()) {
-            const auto program = Parser{}.parseFile(file);
-            vm.run(program);
+
+        if (sourceKind == SourceKind::Script8) {
+            if (!program8.empty())
+                vm.run(program8);
+        } else {
+            vm.run16(program16);
         }
 
         vm.prompt();
+
 #endif
 
         return 0;
+
     } catch (const std::exception& e) {
         std::cerr << "8c: ERROR: " << e.what() << '\n';
         return 1;
